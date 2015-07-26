@@ -1,0 +1,125 @@
+---
+title: "Machine Learning"
+output: html_document
+---
+##Overview  
+The goal of this project is to use a data set that includes accelerometer measurements and activity labels for different people performing 5 different activities to build a machine learning model that can be used to predict, on an external data set, which activity is being performed.
+
+##Getting Data  
+Initially the data had already been split into a training set of 19622 observations and a test set of 20 observations, and both sets were downloaded and read into R on 7/25/2015 using the following code:
+
+```{r eval=FALSE}
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "training.csv", method="curl")
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "testing.csv", method="curl")
+```
+
+```{r}
+training.full <- read.csv("training.csv")
+testing <- read.csv("testing.csv")
+```
+
+##Cleaning Data  
+The first 7 variables are removed because they have to do with indices, user names, or time stamps, which are unrelated to accelerometer measurements. The "user_name" variable could be a useful predictor within the context of this data set, but I have removed it in order to get a prediction function that can be generalized to all people. A summary of the remaining variables shows that many of them contain over 97% NA's. These variables are removed so that the only remaining variables are numeric or integer with no missing data. The result, "training.reduced", consists of 53 variables. Using the "pairs" function to see how every variable plots against "classe", I was able to visually detect a few extreme outliers that were probably data entry or measurement errors, so I filtered those out and put the final data set in "training.clean".
+
+```{r message=FALSE, warning=FALSE}
+# remove variables with irrelevant or missing data
+training.reduced <- training.full[,-c(1,2,3,4,5,6,7,12:36,50:59,69:83,87:101,103:112,125:139,141:150)]
+# remove outliers
+library(dplyr)
+training.clean <- training.reduced %>% filter(gyros_dumbbell_x > -5, gyros_dumbbell_y < 5,
+                                              gyros_dumbbell_z < 5, magnet_dumbbell_y > -1000,
+                                              total_accel_forearm < 90, gyros_forearm_x > -15,
+                                              gyros_forearm_y < 100, gyros_forearm_z < 50)
+```
+
+##Partitioning Data  
+In order to get an unbiased estimate of the out-of-sample error, I will further partition the data in "training.reduced" into a training set (60%) and a validation set (40%). I will use the training set to fit the model, and this will include several iterations of cross-validation to find the best set of parameters. Once I have selected the optimal parameters, I will test the model against the validation set to estimate the out-of-sample error.
+
+```{r message=FALSE, warning=FALSE}
+library(caret)
+set.seed(1234)
+inTrain <- createDataPartition(y = training.reduced$classe, p = 0.6, list=FALSE)
+training <- training.clean[inTrain,]
+validation <- training.clean[-inTrain,]
+```
+
+##Model Selection  
+Gradient Boosting (GBM) is widely considered to be one of the best "out-of-the-box" classification algorithms, so I will train my model using this method and grade it based on its accuracy on the validation set. GBM is an ensembling method that constructs multiple tree classifiers that are then aggregated to make a final prediction. It uses boosting to iteratively change the weights of misclassified samples, create a new tree based on the new weights, and aggregates the trees according to their relative accuracy. There are several parameters that can be tuned in this model, and it will take a long time to train on the entire training set. Therefore, I will begin by using the default parameters on a small subset of the training set just to get an idea of which parameters are the best. By default, the train function uses "bagging" to perform cross-validation. By this method, the data set will be resampled 25 times with replacement, and the out-of-bag samples are used to determine accuracy.
+
+```{r eval=FALSE}
+# Select 2% of the training set
+set.seed(2345)
+inSmall <- createDataPartition(y = training$classe, p = 0.02, list = FALSE)
+training.small <- training[inSmall,]
+
+# Train GBM model on small training set using default parameters
+set.seed(3456)
+gbmFit <- train(classe ~ ., data = training.small, method = 'gbm', verbose = FALSE)
+
+# Analyze results:
+plot(gbmFit)
+```
+
+```{r echo=FALSE}
+gbmFit = readRDS("gbmFit.rds")
+plot(gbmFit)
+```
+
+##Model Tuning  
+You can see in the plot that accuracy increases as you increase the number of boosting iterations (n.trees). Increasing max tree depth (interaction.depth) from 1 to 2 makes a big difference, but going from 2 to 3 doesn't seem to make much of a difference. However, with a larger sample size deeper trees might improve accuracy. Based on this information, I will tune the model with slightly higher parameters for n.trees and interaction.depth. It will be necessary to use a larger sample size to test deeper tree interactions. This will slow down the algorithm, so I will also use only the 20 most influential variables in order to speed things up.
+
+```{r eval=FALSE}
+# Select 8% of the training set
+set.seed(2345)
+inSmall <- createDataPartition(y = training$classe, p = 0.08, list = FALSE)
+training.small4 <- training[inSmall,]
+# set tuning parameters
+gbm.tuneGrid <- expand.grid(interaction.depth = 2:4, n.trees = c(100, 150, 200), shrinkage = 0.1, n.minobsinnode = 10)
+# subset of the 20 most influential variables
+bestVars <- rownames(summary(gbmFit, plotit=FALSE))
+training.influential <- training.small4[,c(bestVars[1:20], 'classe')]
+# train with the new parameters using the same seed as before
+set.seed(3456)
+gbmFit2 <- train(classe ~ ., data = training.influential, method = 'gbm', verbose = FALSE, tuneGrid = gbm.tuneGrid)
+plot(gbmFit2)
+gbmFit2
+```
+
+```{r echo=FALSE}
+gbmFit2 = readRDS("gbmFit2.rds")
+plot(gbmFit2)
+```
+
+There does not seem to be any significant increase in accuracy when n.trees is increased beyond 150 or when interaction.depth is more than 3. Also, the larger sample size significantly improved the accuracy.
+
+## Final Training  
+With evidence that a larger sample size is likely to improve the accuracy to an acceptable level, we are now ready to train the model on the full training set. To get the best possible performance, I will use all 52 predictor variables, and I will use all permutations of interaction.depth in (4,5,6) mixed with n.trees in (200,250). This training will only be performed once since it is likely to take a long time, and I will use parallel processing to try to speed it up.
+
+```{r eval=FALSE}
+library(doParallel)
+registerDoParallel(cores=2)
+training.full.influential <- training[,c(bestVars[1:20], 'classe')]
+gbm.tuneGrid <- expand.grid(interaction.depth = c(4,5,6), n.trees = c(200, 250), shrinkage = 0.1, n.minobsinnode = 10)
+set.seed(34567)
+gbmFitFinal <- train(classe ~ ., data = training, method = 'gbm', verbose = FALSE, tuneGrid = gbm.tuneGrid)
+plot(gbmFitFinal)
+```
+
+```{r echo=FALSE}
+gbmFitFinal = readRDS("gbmFitFinal2.rds")
+plot(gbmFitFinal)
+```
+
+##In-Sample Performance Analysis  
+The best model uses n.trees = 250 and interaction.depth = 6, but it appears from the plot that increasing these values even more would continue to improve the accuracy. Unfortunately due to time constraints (deeper models would take over an hour to run), I will have to settle on the current model, which has 98.5% accuracy on the training set.
+
+##Prediction  
+Because bootstrap cross-validation was used, the training accuracy should be a good predictor of out-of-sample accuracy. However, in order to get a truly unbiased estimate of out-of-sample accuracy, I will use the model to make predictions on the validation set. It is unbiased because the data were partitioned randomly and no validation data were used to train the model.
+
+```{r message=FALSE, warning=FALSE}
+predictions <- predict(gbmFitFinal, validation)
+confusionMatrix(predictions, validation$classe)
+```
+
+##Out-Of-Sample Performance Analysis  
+With over 99% accuracy the model did even better on the validation set than it did on the training set. We can conclude that this model would perform similarly on external data.
